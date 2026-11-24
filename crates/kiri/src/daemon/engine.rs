@@ -1637,6 +1637,8 @@ pub struct Engine {
     stopped: std::sync::atomic::AtomicBool,
     pub store: Store,
     pub networks: Mutex<Networks>,
+    /// Secret values, sealed on disk, that a start may name in its env.
+    pub secrets: Mutex<super::secrets::Secrets>,
     state: Mutex<State>,
     changed: Condvar,
     /// Serialises sending layers, so two creates of a new image don't send
@@ -1823,6 +1825,7 @@ impl Engine {
         let records = store.root().join("containers.json");
         let ceiling = memory_ceiling();
         let networks = Mutex::new(Networks::load(store.root())?);
+        let secrets = Mutex::new(super::secrets::Secrets::load(store.root()));
         let volumes = Mutex::new(super::volumes::Volumes::load(store.root())?);
         let engine = Arc::new(Engine {
             volumes,
@@ -1834,6 +1837,7 @@ impl Engine {
             sleeping: std::sync::atomic::AtomicBool::new(false),
             stopped: std::sync::atomic::AtomicBool::new(stopped_marker().is_some_and(|f| f.exists())),
             networks,
+            secrets,
             store,
             state: Mutex::default(),
             changed: Condvar::new(),
@@ -4158,11 +4162,34 @@ impl Engine {
         {
             return Err(e);
         }
+        // Env entries naming a secret — `secret:db-password` alone, or an
+        // entry whose value is such a reference — become their values only
+        // here, at the guest's start; the record keeps the reference, so a
+        // copied containers.json carries names, not secrets. No entry names
+        // a secret and the env goes to the guest as it is.
+        let env = match spec.env.iter().any(|e| super::secrets::is_secret_ref(e)) {
+            false => std::borrow::Cow::Borrowed(&spec.env),
+            true => match self.secrets.lock() {
+                Ok(s) => match s.resolve(&spec.env) {
+                    Ok(resolved) => std::borrow::Cow::Owned(resolved),
+                    Err(no_such) => {
+                        let e = Error::NotFound(no_such);
+                        self.fail_start(&id, &spec, &e);
+                        return Err(e);
+                    }
+                },
+                Err(_) => {
+                    let e = Error::Conflict("the secrets lock was poisoned".into());
+                    self.fail_start(&id, &spec, &e);
+                    return Err(e);
+                }
+            },
+        };
         let cancelled = || gate.0.cancel.load(std::sync::atomic::Ordering::SeqCst);
         let started = if cancelled() {
             Err(io::Error::other("cancelled before it reached the guest"))
         } else {
-            vm.run(&id, &layers, &argv, &spec.env, &spec.cwd, &spec.user, &hostname, flags, net_args, &spec.mounts, &spec.limits.wire(), spec.caps, &host_opts, &seccomp, &gate.0.cancel)
+            vm.run(&id, &layers, &argv, &env, &spec.cwd, &spec.user, &hostname, flags, net_args, &spec.mounts, &spec.limits.wire(), spec.caps, &host_opts, &seccomp, &gate.0.cancel)
         };
         if let Ok(pid) = started
             && let Some(c) = self.lock().containers.get_mut(&id).filter(|c| c.status == Status::Running)

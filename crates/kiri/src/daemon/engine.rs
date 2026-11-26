@@ -1755,6 +1755,8 @@ pub struct Engine {
     /// invalidated on volume create/remove and container remove while leaving
     /// `GET /system/df` live.
     volume_sizes_cache: Mutex<VolumeSizesCache>,
+    /// Docker Swarm on this one node: services, tasks, secrets and configs.
+    pub swarm: super::swarm::Swarm,
 }
 
 #[derive(Default)]
@@ -1851,6 +1853,7 @@ impl Engine {
         let ceiling = memory_ceiling();
         let networks = Mutex::new(Networks::load(store.root())?);
         let volumes = Mutex::new(super::volumes::Volumes::load(store.root())?);
+        let swarm = super::swarm::Swarm::load(store.root())?;
         let engine = Arc::new(Engine {
             volumes,
             link: Mutex::new(None),
@@ -1898,6 +1901,7 @@ impl Engine {
             image_labels: Mutex::new(HashMap::new()),
             uplink: Mutex::new(serde_json::Value::Null),
             volume_sizes_cache: Mutex::default(),
+            swarm,
         });
         let _ = engine.me.set(Arc::downgrade(&engine));
         engine.start_syncer();
@@ -1907,6 +1911,7 @@ impl Engine {
         engine.start_sleeper();
         engine.start_clock();
         engine.start_k8s_lb();
+        super::swarm::start(&engine);
         #[cfg(target_os = "macos")]
         super::watch::start(Arc::downgrade(&engine));
         Ok(engine)
@@ -2156,7 +2161,7 @@ impl Engine {
     }
 
     /// The VM if it is awake; never boots it.
-    fn awake(&self) -> Option<Arc<VmLink>> {
+    pub(super) fn awake(&self) -> Option<Arc<VmLink>> {
         self.link.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|vm| !vm.is_disconnected()).cloned()
     }
 
